@@ -1,0 +1,336 @@
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(mice)
+library(PerformanceAnalytics)
+library(cluster)
+library(factoextra)
+library(randomForest)
+library(car)
+library(pdp)
+library(vip)
+library(ranger)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+library(foreach)
+library(doParallel)
+library(png)
+library(janitor)
+
+options(stringsAsFactors = FALSE)
+
+# ЗМІННІ
+user_path <- "D:/Akpi4/ds/hw3/part1/migration_attractiveness_data.csv"
+fallback_path <- "/mnt/data/migration_attractiveness_data.csv"
+path <- if (file.exists(user_path)) user_path else fallback_path
+message("Читання даних з: ", path)
+
+
+raw <- read_delim(path, delim = ";", show_col_types = FALSE)
+
+# 1) Очищення імен стовпців
+raw <- raw %>%
+  janitor::clean_names()
+
+# 2)
+if ("country_code_year" %in% names(raw) && !("country_code" %in% names(raw))) {
+  message("Виявлено об'єднаний стовпець 'country_code_year'. Розділяємо...")
+  raw <- raw %>% 
+    separate(country_code_year, into = c("country_code", "year"), sep = 4, extra = "drop", convert = TRUE) %>%
+    mutate(year = as.numeric(year))
+} else {
+    message("Стовпці 'country_code' та 'year' знайдено окремо (або їх імена вже виправлені).")
+}
+
+# Ідентифікатори
+id_col <- "country_code"
+year_col <- "year"
+
+# Індикатори міграційної привабливості та інтеграції
+indicators <- c(
+  "gdp_per_capita_usd",
+  "unemployment_rate_percent",
+  "hdi_index",
+  "corruption_perception_index", 
+  "migrant_pop_share_percent",
+  "mip_ex_index",
+  "asylum_applications_per_100000",
+  "tertiary_edu_enrollment",
+  "wage_gdp_ratio"
+)
+# Фільтруємо індикатори
+indicators <- intersect(indicators, names(raw))
+
+# 3) Вибір робочих стовпців — перевіряємо наявність
+missings <- setdiff(c(id_col, year_col, indicators), names(raw))
+if (length(missings) > 0) stop("Відсутні очікувані стовпці: ", paste(missings, collapse = ", "))
+
+work <- raw %>% select(all_of(c(id_col, year_col, indicators)))
+
+work <- work %>%
+  mutate(across(all_of(indicators), ~ as.numeric(as.character(.))))
+
+# Перевірка: тепер всі індикатори мають бути num
+glimpse(work)
+
+# 4) Пропуски та імпутація
+cat("\nПропуски по індикаторах:\n")
+print(colSums(is.na(work)))
+
+imp_needed <- sum(is.na(work)) > 0
+if (imp_needed) {
+  cat("Запуск MICE (pmm) для імпутації...\n")
+  mice_df <- work %>% select(all_of(indicators)) %>% as.data.frame()
+  
+  # Логічні/категоріальні бінарні перевести в числові
+  mice_df <- mice_df %>% mutate(across(where(is.logical), ~ as.integer(.)))
+  
+  # Запуск MICE
+  imp <- tryCatch({
+    mice(mice_df, m = 1, method = 'pmm', maxit = 10, printFlag = FALSE)
+  }, error = function(e) {
+    message("MICE не спрацював, застосовано медіанну імпутацію: ", e$message)
+    NULL
+  })
+  
+  if (!is.null(imp)) {
+    completed <- complete(imp)
+    work[, indicators] <- completed
+  } else {
+    # Медіанна імпутація по стовпцях
+    for (col in indicators) {
+      if (any(is.na(work[[col]]))) {
+        work[[col]][is.na(work[[col]])] <- median(work[[col]], na.rm = TRUE)
+      }
+    }
+  }
+  cat("Імпутація завершена. Пропусків зараз:\n")
+  print(colSums(is.na(work)))
+} else {
+  cat("Пропуски відсутні — імпутацію пропускаємо.\n")
+}
+
+# 5) Кореляційна матриця
+cat("\nКореляційна матриця:\n")
+num_for_cor <- work %>% select(all_of(indicators)) %>% select(where(is.numeric))
+if (ncol(num_for_cor) < 2) {
+  warning("Недостатньо числових індикаторів для кореляційної матриці.")
+} else {
+  cor_mat <- cor(num_for_cor, use = 'pairwise.complete.obs')
+  print(round(cor_mat, 3))
+}
+
+# 6) PCA (для створення індексу та кластеризації)
+if (ncol(num_for_cor) >= 2) {
+  pca_res <- prcomp(num_for_cor, center = TRUE, scale. = TRUE)
+  cat("\nPCA summary (Головні компоненти міграційної привабливості/інтеграції):\n")
+  print(summary(pca_res))
+  cat("\nPCA Rotations (для інтерпретації компонент):\n")
+  print(pca_res$rotation[, 1:min(3, ncol(pca_res$rotation))]) # перші 3 компоненти
+} else {
+  stop("Недостатньо числових індикаторів для PCA.")
+}
+
+# 7) Кластеризація K-means 
+set.seed(123)
+kmeans_res <- tryCatch({
+  kmeans(scale(num_for_cor), centers = 3, nstart = 25)
+}, error = function(e) {
+  message("kmeans не спрацював: ", e$message); NULL
+})
+if (!is.null(kmeans_res)) {
+  work$cluster <- as.factor(kmeans_res$cluster)
+  cat("Кількість країн у кластерах:\n"); print(table(work$cluster))
+} else {
+  work$cluster <- NA
+}
+
+# 8) Нормалізація min-max
+norm_minmax <- function(x) {
+  if (all(is.na(x))) return(x)
+  rng <- range(x, na.rm = TRUE)
+  if (rng[1] == rng[2]) return(rep(0.5, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+work_norm <- work
+work_norm[indicators] <- lapply(work[indicators], norm_minmax)
+
+# 9) Індекси привабливості/інтеграції 
+work$attractiveness_index_pca <- predict(pca_res)[,1]
+if (length(unique(work$attractiveness_index_pca)) > 1) {
+  work$attractiveness_index_pca <- (work$attractiveness_index_pca - min(work$attractiveness_index_pca)) / (max(work$attractiveness_index_pca) - min(work$attractiveness_index_pca))
+} else {
+  work$attractiveness_index_pca <- 0.5
+}
+
+work$attractiveness_index_mean <- rowMeans(work_norm[indicators], na.rm = TRUE)
+
+cat("\nПідсумки індексів:\n")
+print(summary(work$attractiveness_index_pca))
+print(summary(work$attractiveness_index_mean))
+
+# Далі використовуємо attractiveness_index_pca як цільову змінну.
+
+# 10) Розподіл на train/test
+set.seed(42)
+train_idx <- createDataPartition(work$attractiveness_index_pca, p = 0.8, list = FALSE)
+train <- work[train_idx, ]
+test <- work[-train_idx, ]
+cat("\nРозмір train / test:", nrow(train), "/", nrow(test), "\n")
+
+train[indicators] <- lapply(train[indicators], function(x) if(is.factor(x) || is.logical(x)) as.numeric(as.character(x)) else as.numeric(x))
+test[indicators] <- lapply(test[indicators], function(x) if(is.factor(x) || is.logical(x)) as.numeric(as.character(x)) else as.numeric(x))
+
+# 11) Базовий Random Forest
+rf_formula <- as.formula(paste("attractiveness_index_pca ~", paste(indicators, collapse = " + ")))
+cat("\nНавчання базового RandomForest (ntree=200, importance=TRUE) для прогнозування Індексу...\n")
+set.seed(101)
+rf_baseline <- randomForest(rf_formula, data = train, ntree = 200, importance = TRUE, na.action = na.omit)
+print(rf_baseline)
+
+pred_test_baseline <- predict(rf_baseline, newdata = test)
+rmse_baseline <- sqrt(mean((pred_test_baseline - test$attractiveness_index_pca)^2))
+mae_baseline <- mean(abs(pred_test_baseline - test$attractiveness_index_pca))
+cat(sprintf("\nБазовий RF - Test RMSE = %.4f, MAE = %.4f\n", rmse_baseline, mae_baseline))
+
+oob_err_baseline <- tryCatch({
+  tail(rf_baseline$mse, n = 1)
+}, error = function(e) NA)
+cat(sprintf("Базовий RF - OOB MSE = %s (OOB RMSE = %s)\n", format(oob_err_baseline), if(!is.na(oob_err_baseline)) sprintf("%.4f", sqrt(oob_err_baseline)) else "NA"))
+
+# 12) Діагностика / Перевірка адекватності
+diag_dir <- "migration_diagnostics_outputs"
+if (!dir.exists(diag_dir)) dir.create(diag_dir)
+
+# 12.1 Overfitting
+pred_train_baseline <- predict(rf_baseline, newdata = train)
+rmse_train <- sqrt(mean((pred_train_baseline - train$attractiveness_index_pca)^2))
+cat(sprintf("Train RMSE = %.4f | Test RMSE = %.4f | Відношення (train/test) = %.3f\n", rmse_train, rmse_baseline, rmse_train / rmse_baseline))
+
+# 12.2 Залишки та графік
+residuals_test <- test$attractiveness_index_pca - pred_test_baseline
+p_resid <- ggplot(data.frame(pred = pred_test_baseline, resid = residuals_test), aes(x = pred, y = resid)) +
+  geom_point(alpha = 0.6) + geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Залишки vs Передбачене (Test)", x = "Передбачене", y = "Залишки") + theme_minimal()
+ggsave(filename = file.path(diag_dir, "residuals_vs_pred_test.png"), plot = p_resid, width = 7, height = 5) 
+
+
+# 12.3 Тест нормальності
+shapiro_p <- if (length(residuals_test) >= 3 && length(residuals_test) <= 5000) {
+  sh <- shapiro.test(residuals_test); sh$p.value
+} else NA
+cat("Shapiro-Wilk p-value (залишки test):", shapiro_p, "\n")
+
+# 12.4 VIF
+cat("Обчислення VIF на основі лінійної моделі attractiveness_index_pca ~ indicators\n")
+lm_for_vif <- lm(attractiveness_index_pca ~ ., data = train %>% select(attractiveness_index_pca, all_of(indicators)))
+vif_vals <- tryCatch(vif(lm_for_vif), error = function(e) { message("VIF не спрацював: ", e$message); rep(NA, length(indicators))})
+vif_df <- data.frame(feature = names(vif_vals), vif = as.numeric(vif_vals)) %>% arrange(desc(vif))
+print(vif_df)
+write_csv(vif_df, file.path(diag_dir, "vif_values.csv"))
+
+# 12.5 Observed vs Predicted
+p_obs_pred <- ggplot(data.frame(obs = test$attractiveness_index_pca, pred = pred_test_baseline), aes(x = obs, y = pred)) +
+  geom_point(alpha = 0.6) + geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Фактичні vs Передбачені (Test)", x = "Фактичні (Індекс)", y = "Передбачені (Індекс)") + theme_minimal()
+ggsave(filename = file.path(diag_dir, "observed_vs_predicted_test.png"), plot = p_obs_pred, width = 6, height = 6) 
+
+
+resid_summary <- data.frame(set = c("train", "test"),
+                            rmse = c(rmse_train, rmse_baseline),
+                            mae = c(mean(abs(train$attractiveness_index_pca - pred_train_baseline)), mean(abs(residuals_test))))
+write_csv(resid_summary, file.path(diag_dir, "residual_summary.csv"))
+
+# 13) Важливість ознак (robust)
+
+perm_importance <- function(model, data, target_col, feature_cols, n_repeats = 10) {
+  # 1. Обчислюємо базову помилку (RMSE) на оригінальних даних
+  actual <- data[[target_col]]
+  pred_base <- predict(model, newdata = data)
+  rmse_base <- sqrt(mean((actual - pred_base)^2))
+  
+  results <- data.frame(feature = feature_cols, mean_increase = NA)
+  
+  # 2. Проходимо по кожній ознаці
+  for (i in seq_along(feature_cols)) {
+    feat <- feature_cols[i]
+    diffs <- numeric(n_repeats)
+    
+    for (j in 1:n_repeats) {
+      data_perm <- data
+      data_perm[[feat]] <- sample(data_perm[[feat]])
+      
+      pred_perm <- predict(model, newdata = data_perm)
+      rmse_perm <- sqrt(mean((actual - pred_perm)^2))
+      
+      diffs[j] <- rmse_perm - rmse_base
+    }
+    results$mean_increase[i] <- mean(diffs)
+  }
+  
+  return(results %>% arrange(desc(mean_increase)))
+}
+
+# 14) Пермутаційна важливість
+cat("\nОбчислюємо пермутаційну важливість (зростання RMSE при перемішуванні ознаки)...\n")
+perm_imp_df <- perm_importance(rf_baseline, test, "attractiveness_index_pca", indicators, n_repeats = 25)
+write_csv(perm_imp_df, file.path(diag_dir, "permutation_importance.csv"))
+print(perm_imp_df)
+
+p_perm <- ggplot(perm_imp_df, aes(x = reorder(feature, mean_increase), y = mean_increase)) +
+  geom_col() + coord_flip() + labs(title = "Пермутаційна важливість (зростання RMSE)", x = "", y = "Середнє збільшення RMSE") + theme_minimal()
+ggsave(filename = file.path(diag_dir, "permutation_importance.png"), plot = p_perm, width = 7, height = 5) 
+
+# 15) PDP та ICE для топ-ознак (відображають вплив індикаторів на Індекс)
+top_feats <- head(perm_imp_df$feature, 3)
+cat("Топ-ознаки для PDP/ICE:", paste(top_feats, collapse = ", "), "\n")
+for (feat in top_feats) {
+  pd <- tryCatch({
+    partial(rf_baseline, pred.var = feat, train = train, grid.resolution = 20, progress = "none")
+  }, error = function(e) {
+    message("PDP не вдалося для ", feat, ": ", e$message); NULL
+  })
+  if (!is.null(pd)) {
+    pd_df <- as.data.frame(pd)
+    p_pd <- ggplot(pd_df, aes_string(x = feat, y = "yhat")) +
+      geom_line() + labs(title = paste("PDP для", feat), x = feat, y = "Частковий ефект (Прогноз Індексу)") + theme_minimal()
+    ggsave(filename = file.path(diag_dir, paste0("pdp_", feat, ".png")), plot = p_pd, width = 7, height = 5) 
+  }
+
+  ice_obj <- tryCatch({
+    partial(rf_baseline, pred.var = feat, train = train, ice = TRUE, grid.resolution = 20, progress = "none")
+  }, error = function(e) { message("ICE не вдалося для ", feat, ": ", e$message); NULL })
+  if (!is.null(ice_obj)) {
+    ice_df <- as.data.frame(ice_obj)
+    if (all(c(".id","x","yhat") %in% names(ice_df))) {
+      p_ice <- ggplot(ice_df, aes(x = x, y = yhat, group = .id)) + geom_line(alpha = 0.15) +
+        labs(title = paste("ICE для", feat), x = feat, y = "Прогноз Індексу") + theme_minimal()
+      ggsave(filename = file.path(diag_dir, paste0("ice_", feat, ".png")), plot = p_ice, width = 7, height = 5)
+    }
+  }
+}
+
+
+rf_best <- rf_baseline
+
+pred_stability_df <- data.frame(site = character(0), pred_mean = numeric(0), pred_sd = numeric(0), stringsAsFactors = FALSE)
+
+
+# 16) Збереження фінальної таблиці
+work_final <- work
+all_pred_best <- tryCatch(predict(rf_best, newdata = work), error = function(e) rep(NA, nrow(work)))
+work_final$pred_best_rf <- all_pred_best
+
+if (nrow(pred_stability_df) > 0) {
+ work_final <- work_final %>%
+  left_join(pred_stability_df %>% select(site, pred_mean, pred_sd) %>% rename(!!id_col := site), by = id_col)
+}
+write_csv(work_final, "migration_analysis_results_full.csv")
+cat("\nЗбережено повні результати у: migration_analysis_results_full.csv\n")
+
+
+
+cat("Перевірте папку '", diag_dir, "' та файл 'migration_analysis_results_full.csv' для результатів.\n")
